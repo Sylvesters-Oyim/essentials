@@ -1,0 +1,20 @@
+# Rules that apply to every tool in the collection. Anything specific to one
+# tool (its data files, its local config) belongs in that tool's own .gitignore.
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Databases are almost always personal data
+*.db
+*.sqlite
+*.sqlite3
+
+# OS and editor noise
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
