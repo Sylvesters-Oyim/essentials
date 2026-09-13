@@ -17,6 +17,7 @@ import argparse
 import csv
 import ctypes
 import json
+import os
 import sys
 import threading
 import time
@@ -26,8 +27,10 @@ from pathlib import Path
 from tkinter import messagebox
 
 APP_NAME = "Strict Pomodoro"
+__version__ = "1.1.0"   # MAJOR.MINOR.PATCH - see CHANGELOG.md
 DATA_FILE = Path(__file__).resolve().parent / "sessions.csv"
 SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
+TODO_FILE = Path(__file__).resolve().parent / "todos.json"
 
 DEFAULTS = {"work": 25.0, "short": 5.0, "long": 15.0, "cycle": 4, "strict": True}
 LIMITS = {"work": (0.01, 600), "short": (0.01, 600), "long": (0.01, 600),
@@ -298,6 +301,120 @@ class Log:
         return seen
 
 
+class TodoStore:
+    """What you mean to work on, kept across restarts in todos.json.
+
+    Unfinished items stay until you tick them off or delete them. A file that
+    cannot be read is set aside under a new name rather than overwritten, so a
+    bad hand edit or a sync conflict never silently wipes the list.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.items: list[dict] = []
+        self.set_aside_as: Path | None = None
+        self.last_save_ok = True
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self._set_aside()
+            return
+        entries = raw.get("todos", []) if isinstance(raw, dict) else []
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            text = str(entry.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                item_id = int(entry.get("id"))
+            except (TypeError, ValueError):
+                item_id = self._next_id()
+            self.items.append({
+                "id": item_id,
+                "text": text,
+                "done": bool(entry.get("done")),
+                "created": str(entry.get("created") or ""),
+                "done_at": entry.get("done_at") or None,
+            })
+
+    def _set_aside(self) -> None:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = self.path.with_name(f"todos.unreadable-{stamp}.json")
+        try:
+            self.path.rename(target)
+            self.set_aside_as = target
+        except OSError:
+            pass
+
+    def save(self) -> bool:
+        """Write to a temporary file first, then swap it in, so a crash
+        mid-write can never leave a half-written list behind."""
+        temp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            temp.write_text(json.dumps({"todos": self.items}, indent=2) + "\n",
+                            encoding="utf-8")
+            os.replace(temp, self.path)
+            self.last_save_ok = True
+        except OSError:
+            self.last_save_ok = False
+        return self.last_save_ok
+
+    def _next_id(self) -> int:
+        return max((item["id"] for item in self.items), default=0) + 1
+
+    @staticmethod
+    def same(a: str, b: str) -> bool:
+        return a.strip().casefold() == b.strip().casefold()
+
+    def open_items(self) -> list[dict]:
+        return [item for item in self.items if not item["done"]]
+
+    def done_items(self) -> list[dict]:
+        return [item for item in self.items if item["done"]]
+
+    def add(self, text: str):
+        text = " ".join(text.split())
+        if not text:
+            return None
+        for item in self.open_items():
+            if self.same(item["text"], text):
+                return item            # already on the list; do not duplicate
+        item = {"id": self._next_id(), "text": text, "done": False,
+                "created": datetime.now().isoformat(timespec="minutes"),
+                "done_at": None}
+        self.items.append(item)
+        self.save()
+        return item
+
+    def set_done(self, item_id: int, done: bool) -> None:
+        for item in self.items:
+            if item["id"] == item_id:
+                item["done"] = done
+                item["done_at"] = (datetime.now().isoformat(timespec="minutes")
+                                   if done else None)
+        self.save()
+
+    def remove(self, item_id: int) -> None:
+        self.items = [item for item in self.items if item["id"] != item_id]
+        self.save()
+
+    def clear_done(self) -> None:
+        self.items = self.open_items()
+        self.save()
+
+    def next_open(self, excluding: str = ""):
+        for item in self.open_items():
+            if not self.same(item["text"], excluding):
+                return item
+        return None
+
+
 class HoldButton(tk.Canvas):
     """A button that only fires after being held down for `seconds`."""
 
@@ -358,6 +475,9 @@ class Pomodoro:
         self._lift_job = None
         self._history = None
         self._settings = None
+        self._todo_win = None
+        self._todo_render_pending = False
+        self.todos = TodoStore(TODO_FILE)
         self.paused_at = None       # monotonic time the pause started
         self.paused_total = 0.0     # seconds paused so far this phase
         self._nagged = False
@@ -431,6 +551,10 @@ class Pomodoro:
                             font=(self.ui_font, 9), cursor="hand2")
         settings.pack(side="right", padx=(0, 6))
         settings.bind("<Button-1>", self.show_settings)
+        todos = tk.Label(foot, text="todos  ·", bg=BG, fg="#4a505a",
+                         font=(self.ui_font, 9), cursor="hand2")
+        todos.pack(side="right", padx=(0, 6))
+        todos.bind("<Button-1>", self.show_todos)
 
         self.buttons = tk.Frame(pad, bg=BG)
         self.buttons.pack()
@@ -467,6 +591,8 @@ class Pomodoro:
 
         self.root.bind("<Control-p>", self.toggle_pause)
         self.root.bind("<Control-comma>", self.show_settings)
+        self.root.bind("<Control-t>", self.show_todos)
+        self.task_var.trace_add("write", lambda *_: self._queue_todo_render())
 
         self.pin = tk.Label(self.root, text="pinned on top", bg=BG, fg="#4a505a",
                             font=(self.ui_font, 8), cursor="hand2")
@@ -476,16 +602,33 @@ class Pomodoro:
     def current_label(self) -> str:
         return self.task_var.get().strip()
 
+    def quick_pick(self):
+        """(open todos, recent tags not already on the todo list)."""
+        todo_texts = [item["text"] for item in self.todos.open_items()]
+        recent = [task for task in self.log.recent_tasks()
+                  if not any(TodoStore.same(task, t) for t in todo_texts)]
+        return todo_texts, recent
+
     def show_recent_menu(self, event):
-        """Quick-pick from what you have actually been working on lately."""
-        tasks = self.log.recent_tasks()
-        if not tasks:
+        """Quick-pick: open todos first, then what you have worked on lately."""
+        todo_texts, recent = self.quick_pick()
+        if not todo_texts and not recent:
             return
         menu = tk.Menu(self.root, tearoff=0, bg=PANEL, fg=FG, bd=0,
                        activebackground=COLORS["work"], activeforeground=BG,
                        font=(self.ui_font, 9))
-        for task in tasks:
-            menu.add_command(label=task, command=lambda v=task: self.task_var.set(v))
+        if todo_texts:
+            menu.add_command(label="TODO", state="disabled")
+            for task in todo_texts:
+                menu.add_command(label="   " + task,
+                                 command=lambda v=task: self.task_var.set(v))
+        if recent:
+            if todo_texts:
+                menu.add_separator()
+            menu.add_command(label="RECENT", state="disabled")
+            for task in recent:
+                menu.add_command(label="   " + task,
+                                 command=lambda v=task: self.task_var.set(v))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -832,6 +975,191 @@ class Pomodoro:
             self._settings.destroy()
             self._settings = None
 
+    # ----------------------------------------------------------------- todos
+
+    def show_todos(self, _event=None):
+        """A list of what you mean to work on, feeding the working-on box."""
+        if self._todo_win is not None and self._todo_win.winfo_exists():
+            self._todo_win.deiconify()
+            self._todo_win.lift()
+            self._todo_entry.focus_set()
+            return
+
+        win = tk.Toplevel(self.root)
+        self._todo_win = win
+        win.title("Todo")
+        win.configure(bg=BG)
+        win.geometry("420x540")
+        win.minsize(340, 300)
+        win.protocol("WM_DELETE_WINDOW", self._close_todos)
+
+        pad = tk.Frame(win, bg=BG)
+        pad.pack(fill="both", expand=True, padx=20, pady=16)
+
+        head = tk.Frame(pad, bg=BG)
+        head.pack(fill="x")
+        tk.Label(head, text="TODO", bg=BG, fg=MUTED,
+                 font=(self.ui_font, 9, "bold")).pack(side="left")
+        self._todo_counts = tk.Label(head, text="", bg=BG, fg="#4a505a",
+                                     font=(self.ui_font, 9))
+        self._todo_counts.pack(side="right")
+
+        add = tk.Frame(pad, bg=BG)
+        add.pack(fill="x", pady=(8, 4))
+        self._todo_entry = tk.Entry(add, bg=PANEL, fg=FG, insertbackground=FG,
+                                    relief="flat", font=(self.ui_font, 11))
+        self._todo_entry.pack(side="left", fill="x", expand=True, ipady=6)
+        self._todo_entry.bind("<Return>", lambda _e: self._add_todo())
+        tk.Button(add, text="Add", command=self._add_todo, bg=COLORS["work"],
+                  fg=BG, activebackground=COLORS["work"], activeforeground=BG,
+                  relief="flat", bd=0, cursor="hand2", padx=16,
+                  font=(self.ui_font, 10, "bold")).pack(side="left", padx=(8, 0),
+                                                        fill="y")
+
+        tk.Label(pad, text="click a task to work on it  ·  tick it when it is done",
+                 bg=BG, fg="#3f454e", font=(self.ui_font, 8)).pack(anchor="w",
+                                                                   pady=(2, 10))
+
+        self._todo_notice = tk.Label(pad, text="", bg=BG, fg=PAUSED,
+                                     font=(self.ui_font, 9), wraplength=360,
+                                     justify="left")
+        self._todo_notice.pack(anchor="w")
+        if self.todos.set_aside_as is not None:
+            self._todo_notice.configure(
+                text=f"todos.json could not be read, so it was kept as "
+                     f"{self.todos.set_aside_as.name} and a fresh list started.")
+
+        body = tk.Frame(pad, bg=BG)
+        body.pack(fill="both", expand=True)
+        canvas = tk.Canvas(body, bg=BG, highlightthickness=0)
+        bar = tk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        self._todo_list = tk.Frame(canvas, bg=BG)
+        self._todo_list.bind("<Configure>", lambda _e: canvas.configure(
+            scrollregion=canvas.bbox("all")))
+        list_window = canvas.create_window((0, 0), window=self._todo_list,
+                                           anchor="nw")
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(list_window, width=e.width))
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        win.bind("<MouseWheel>", lambda e: canvas.yview_scroll(
+            int(-e.delta / 120), "units"))
+
+        clear = tk.Label(pad, text="clear completed", bg=BG, fg="#4a505a",
+                         cursor="hand2", font=(self.ui_font, 9))
+        clear.pack(anchor="e", pady=(10, 0))
+        clear.bind("<Button-1>", lambda _e: self._clear_done_todos())
+
+        self._render_todos()
+        self._todo_entry.focus_set()
+
+    def _close_todos(self):
+        if self._todo_win is not None:
+            self._todo_win.destroy()
+            self._todo_win = None
+
+    def _queue_todo_render(self):
+        """Coalesce redraws, and never rebuild a row from inside its own click."""
+        if self._todo_render_pending or self._todo_win is None:
+            return
+        self._todo_render_pending = True
+        self.root.after_idle(self._render_todos)
+
+    def _render_todos(self):
+        self._todo_render_pending = False
+        if self._todo_win is None or not self._todo_win.winfo_exists():
+            return
+        for child in self._todo_list.winfo_children():
+            child.destroy()
+
+        _count, _total, spent = self.log.breakdown(date.min)
+        minutes = {task.casefold(): mins for task, mins, _c in spent}
+        current = self.current_label()
+        open_items, done_items = self.todos.open_items(), self.todos.done_items()
+
+        self._todo_counts.configure(
+            text=f"{len(open_items)} open  ·  {len(done_items)} done")
+
+        if not open_items:
+            tk.Label(self._todo_list, text="Nothing open. Add what you mean to work on.",
+                     bg=BG, fg="#3f454e", font=(self.ui_font, 10)).pack(
+                         anchor="w", pady=6)
+        for item in open_items:
+            self._todo_row(item, minutes.get(item["text"].casefold(), 0),
+                           TodoStore.same(item["text"], current))
+
+        if done_items:
+            tk.Label(self._todo_list, text="DONE", bg=BG, fg="#4a505a",
+                     font=(self.ui_font, 8, "bold")).pack(anchor="w", pady=(16, 2))
+            for item in done_items:
+                self._todo_row(item, minutes.get(item["text"].casefold(), 0), False)
+
+    def _todo_row(self, item: dict, minutes: float, is_current: bool):
+        done = item["done"]
+        row = tk.Frame(self._todo_list, bg=PANEL if is_current else BG)
+        row.pack(fill="x", pady=1)
+
+        var = tk.BooleanVar(value=done)
+        tk.Checkbutton(row, variable=var, bg=row["bg"], activebackground=row["bg"],
+                       selectcolor=PANEL, bd=0, highlightthickness=0, cursor="hand2",
+                       command=lambda: self._set_todo_done(item, var.get())).pack(
+                           side="left", padx=(4, 2))
+
+        remove = tk.Label(row, text="✕", bg=row["bg"], fg="#4a505a", cursor="hand2",
+                          font=(self.ui_font, 9))
+        remove.pack(side="right", padx=(6, 8))
+        remove.bind("<Button-1>", lambda _e: self._delete_todo(item))
+
+        if minutes >= 1:
+            tk.Label(row, text=human(minutes), bg=row["bg"], fg="#5b626c",
+                     font=(self.ui_font, 9)).pack(side="right")
+
+        font = (self.ui_font, 10, "bold" if is_current else "normal")
+        if done:
+            font = (self.ui_font, 10, "overstrike")
+        text = ("▶  " if is_current else "") + item["text"]
+        label = tk.Label(row, text=text, bg=row["bg"], anchor="w", justify="left",
+                         fg=COLORS["work"] if is_current else ("#5b626c" if done else FG),
+                         font=font, wraplength=250, cursor="" if done else "hand2")
+        label.pack(side="left", fill="x", expand=True, pady=6)
+        if not done:
+            label.bind("<Button-1>", lambda _e: self.task_var.set(item["text"]))
+
+    def _add_todo(self):
+        item = self.todos.add(self._todo_entry.get())
+        self._todo_entry.delete(0, "end")
+        if item is None:
+            return
+        self._check_todo_saved()
+        if not self.current_label():
+            self.task_var.set(item["text"])   # nothing on the go: start with this
+        self._queue_todo_render()
+
+    def _set_todo_done(self, item: dict, done: bool):
+        self.todos.set_done(item["id"], done)
+        self._check_todo_saved()
+        # Finishing the thing you are on moves you to the next thing on the list.
+        if done and TodoStore.same(item["text"], self.current_label()):
+            upcoming = self.todos.next_open(excluding=item["text"])
+            self.task_var.set(upcoming["text"] if upcoming else "")
+        self._queue_todo_render()
+
+    def _delete_todo(self, item: dict):
+        self.todos.remove(item["id"])
+        self._check_todo_saved()
+        self._queue_todo_render()
+
+    def _clear_done_todos(self):
+        self.todos.clear_done()
+        self._check_todo_saved()
+        self._queue_todo_render()
+
+    def _check_todo_saved(self):
+        if not self.todos.last_save_ok:
+            self._todo_notice.configure(text="Could not write todos.json; "
+                                             "changes will be lost on restart.")
+
     # --------------------------------------------------------------- history
 
     def show_history(self, _event=None):
@@ -975,6 +1303,13 @@ class Pomodoro:
             entry.configure(highlightthickness=1, highlightbackground=color,
                             highlightcolor=color)
 
+        if self.todos.open_items():
+            pick = tk.Label(box, text="choose from your todos ▾", bg="#0b0d10",
+                            fg=color if switching else "#5b626c", cursor="hand2",
+                            font=(self.ui_font, 9))
+            pick.pack(pady=(8, 0))
+            pick.bind("<Button-1>", self.show_recent_menu)
+
         tk.Label(box, text="whatever this says when the break ends is what gets logged",
                  bg="#0b0d10", fg="#3f454e", font=(self.ui_font, 9)).pack(pady=(7, 22))
 
@@ -1068,6 +1403,8 @@ def parse_args(argv=None):
     p.add_argument("--soft", dest="strict", action="store_const", const=False,
                    default=None, help="do not black out the screen during breaks")
     p.add_argument("--selftest", type=float, default=0, help=argparse.SUPPRESS)
+    p.add_argument("--version", action="version",
+                   version=f"{APP_NAME} {__version__}")
     return p.parse_args(argv)
 
 

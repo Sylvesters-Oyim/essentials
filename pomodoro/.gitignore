@@ -1,3 +1,6 @@
 # Personal data written by the app at runtime. Never commit.
 sessions.csv
 settings.json
+todos.json
+todos.*.json
+*.tmp

@@ -95,13 +95,39 @@ That tag is the whole basis of the history: no tag, no idea where the hours went
 Click **history** for where the time went: today and this week broken down per
 task, plus the last seven days. It is a snapshot — reopen it to refresh.
 
+## Todo list
+
+Click **todos** in the window, or press `Ctrl+T`, for a list of what you mean to
+work on. It feeds the working-on box, so planning and tracking stay one thing.
+
+- **Type a task and press Enter.** If nothing is being worked on yet, the new
+  task becomes the working-on tag straight away.
+- **Click a task to work on it.** It is marked with ▶ and every block you run
+  is logged against it.
+- **Tick it when it is done.** If it was the task you were on, the working-on
+  box moves to the next open task, or clears if the list is empty. Ticking a
+  task you are *not* on leaves your current tag alone.
+- **Anything not ticked stays**, across breaks, restarts and days, until you
+  finish it or delete it with ✕. Untick a finished task to reopen it.
+- **Each task shows the time already logged against it**, so a todo that has
+  quietly eaten five hours is visible as one.
+- Open todos appear at the top of the **recent ▾** menu, and on the break screen
+  under "choose from your todos ▾" — so after a long break you can pick the next
+  task from the list instead of retyping it.
+- **clear completed** removes the ticked ones when the list gets long.
+
+The list lives in `todos.json`. It is written safely (to a temporary file, then
+swapped in), and if the file is ever unreadable — a bad hand edit, a sync
+conflict — it is renamed to `todos.unreadable-<date>.json` and kept, rather than
+being overwritten by an empty list.
+
 ## Independence
 
 This app depends on nothing but the Python standard library, and nothing reads
 its files. It is not connected to any other tool in this collection, so it can
 be copied out, changed or deleted on its own.
 
-Your `sessions.csv` and `settings.json` are personal and stay on your machine:
+Your `sessions.csv`, `settings.json` and `todos.json` are personal and stay on your machine:
 this folder's `.gitignore` keeps both out of the repository.
 
 ## Changing the durations
