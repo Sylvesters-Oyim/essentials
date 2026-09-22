@@ -1,16 +1,21 @@
 # Strict Pomodoro
 
-A single-file focus timer for Windows. 25 minutes of work, 5 minutes off, and a
-15 minute break after every 4th block. No dependencies beyond the Python
-standard library.
+A single-file focus timer for Windows, Linux and macOS. 25 minutes of work,
+5 minutes off, and a 15 minute break after every 4th block. No dependencies
+beyond the Python standard library.
 
 ## Run it
 
-Double-click `Pomodoro.bat`, or from a terminal:
+On Windows, double-click `Pomodoro.bat`. From a terminal anywhere:
 
 ```
 python pomodoro.py
 ```
+
+Linux needs Tk present (`sudo apt install python3-tk` on Debian/Ubuntu). Chimes
+use `winsound` on Windows and a command-line player elsewhere — `paplay`,
+`aplay`, `afplay` or `play`, whichever is installed. With none of them the
+timer runs normally and stays silent.
 
 ## What makes it strict
 

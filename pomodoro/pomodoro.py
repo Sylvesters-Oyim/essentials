@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict Pomodoro - a small, unforgiving focus timer for Windows.
+"""Strict Pomodoro - a small, unforgiving focus timer for Windows, Linux and macOS.
 
 Rules of the house:
   * Phases run back to back. Nothing waits for you to click "next".
@@ -14,20 +14,26 @@ Rules of the house:
 from __future__ import annotations
 
 import argparse
+import array
 import csv
 import ctypes
 import json
+import math
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+import wave
 import tkinter as tk
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import messagebox
 
 APP_NAME = "Strict Pomodoro"
-__version__ = "1.1.0"   # MAJOR.MINOR.PATCH - see CHANGELOG.md
+__version__ = "1.2.0"   # MAJOR.MINOR.PATCH - see CHANGELOG.md
 DATA_FILE = Path(__file__).resolve().parent / "sessions.csv"
 SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
 TODO_FILE = Path(__file__).resolve().parent / "todos.json"
@@ -84,19 +90,89 @@ def human(minutes: float) -> str:
     return f"{minutes // 60}h {minutes % 60:02d}m"
 
 
+# Command-line players, in preference order: PulseAudio/PipeWire, ALSA,
+# macOS, then sox. The first one present wins.
+_PLAYERS = (("paplay", ()), ("aplay", ("-q",)), ("afplay", ()), ("play", ("-q",)))
+
+
+def _find_player():
+    """First available audio player as (exe, args), or None."""
+    for name, args in _PLAYERS:
+        exe = shutil.which(name)
+        if exe:
+            return exe, args
+    return None
+
+
+def _write_tones(pattern, path, rate=44100, volume=0.35) -> None:
+    """Render (freq, milliseconds) pairs to a mono 16-bit WAV file.
+
+    Each tone is faded in and out over 5 ms; without that the square edge at
+    the start and end of a sine burst is audible as a click.
+    """
+    frames = array.array("h")
+    fade = max(1, int(rate * 0.005))
+    for freq, dur_ms in pattern:
+        count = int(rate * dur_ms / 1000)
+        for i in range(count):
+            level = volume
+            if i < fade:
+                level *= i / fade
+            elif i > count - fade:
+                level *= max(0, count - i) / fade
+            frames.append(int(32767 * level * math.sin(2 * math.pi * freq * i / rate)))
+        frames.extend([0] * int(rate * 0.02))   # brief gap between tones
+    with wave.open(str(path), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        out.writeframes(frames.tobytes())
+
+
 def beep(pattern) -> None:
-    """Play a short tone pattern off the UI thread. Silent if unsupported."""
-    try:
-        import winsound
-    except ImportError:
+    """Play a short tone pattern off the UI thread. Silent if unsupported.
+
+    Windows has winsound.Beep built in. Elsewhere there is no stdlib tone
+    generator, so the pattern is rendered to a temporary WAV and handed to
+    whichever command-line player the system has.
+    """
+    if sys.platform.startswith("win"):
+        try:
+            import winsound
+        except ImportError:
+            return
+
+        def run_windows():
+            for freq, dur in pattern:
+                try:
+                    winsound.Beep(freq, dur)
+                except Exception:
+                    return
+
+        threading.Thread(target=run_windows, daemon=True).start()
         return
 
+    player = _find_player()
+    if player is None:
+        return
+    exe, args = player
+
     def run():
-        for freq, dur in pattern:
-            try:
-                winsound.Beep(freq, dur)
-            except Exception:
-                return
+        tmp = None
+        try:
+            handle, tmp = tempfile.mkstemp(prefix="pomodoro-", suffix=".wav")
+            os.close(handle)
+            _write_tones(pattern, tmp)
+            subprocess.run([exe, *args, tmp], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            return
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -146,13 +222,28 @@ def save_settings(values: dict) -> bool:
         return False
 
 
-def virtual_screen():
-    """Bounding box of all monitors: (x, y, width, height)."""
+def virtual_screen(root=None):
+    """Bounding box of all monitors: (x, y, width, height).
+
+    Windows reports the true multi-monitor rectangle through GetSystemMetrics.
+    Elsewhere ctypes.windll does not exist, so ask Tk: the virtual root covers
+    every monitor on X11, and winfo_screen* is the single-screen fallback.
+    """
     try:
         m = ctypes.windll.user32.GetSystemMetrics
         return m(76), m(77), m(78), m(79)
     except Exception:
-        return 0, 0, 1920, 1080
+        pass
+    if root is not None:
+        try:
+            width = root.winfo_vrootwidth()
+            height = root.winfo_vrootheight()
+            if width > 0 and height > 0:
+                return root.winfo_vrootx(), root.winfo_vrooty(), width, height
+            return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+        except Exception:
+            pass
+    return 0, 0, 1920, 1080
 
 
 class Log:
@@ -1257,7 +1348,7 @@ class Pomodoro:
     def open_overlay(self):
         if self.overlay is not None:
             return
-        x, y, w, h = virtual_screen()
+        x, y, w, h = virtual_screen(self.root)
         color = COLORS[self.kind]
 
         ov = tk.Toplevel(self.root)

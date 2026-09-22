@@ -5,6 +5,20 @@ PATCH, and a change that breaks existing use (such as an old `sessions.csv` no
 longer loading) bumps MAJOR. Each release is tagged in git as
 `pomodoro-vX.Y.Z`.
 
+## 1.2.0 — 2026-09-22
+
+### Added
+- Chimes on Linux and macOS. There is no stdlib tone generator outside
+  Windows, so the pattern is rendered to a temporary WAV and played with
+  whichever of `paplay`, `aplay`, `afplay` or `play` is installed. Silent, as
+  before, when none is.
+
+### Fixed
+- The break blackout no longer assumes 1920x1080 off Windows. `ctypes.windll`
+  does not exist there, so the old fallback left any taller or wider screen
+  partly uncovered — you could keep working through a break. Tk now reports
+  the real geometry, using the virtual root so multi-monitor still works.
+
 ## 1.1.0 — 2026-09-13
 
 ### Added
